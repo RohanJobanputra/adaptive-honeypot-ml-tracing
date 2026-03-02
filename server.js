@@ -1,143 +1,174 @@
-const express = require('express');
-const mongoose = require('mongoose');
-const bodyParser = require('body-parser');
-const useragent = require('useragent');
+const express = require("express");
+const mongoose = require("mongoose");
+const bodyParser = require("body-parser");
+const cookieParser = require("cookie-parser");
+const axios = require("axios");
+
+const Log = require("./models/Log");
+const Trace = require("./models/trace");
 
 const app = express();
 
-// Middleware
+/* ---------------- MIDDLEWARE ---------------- */
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
-app.use(express.static('public'));
+app.use(cookieParser());
+app.use(express.static("public"));
 
-// MongoDB connection
-mongoose.connect('mongodb://localhost:27017/honeypot_logs', {
-  useNewUrlParser: true,
-  useUnifiedTopology: true
-}).then(() => console.log("MongoDB connected"))
-  .catch(err => console.error("MongoDB connection error:", err));
+/* ---------------- DB ---------------- */
+mongoose.connect("mongodb://127.0.0.1:27017/honeypot_logs")
+  .then(() => console.log("✅ MongoDB connected"))
+  .catch(err => console.error(err));
 
-// Schemas
-const logSchema = new mongoose.Schema({
-  timestamp: { type: Date, default: Date.now },
-  ip: String,
-  userAgent: String,
-  referrer: String,
-  uniqueUserId: String,
-  interactionType: String,
-  details: Object,
-  botScore: Number,
-  classification: String
-});
-
-const traceSchema = new mongoose.Schema({
-  timestamp: { type: Date, default: Date.now },
-  uniqueUserId: String,
-  leakUrls: [String]
-});
-
-const Log = mongoose.model('Log', logSchema);
-const Trace = mongoose.model('Trace', traceSchema); // ✅ Added for Phase 4 Tracing
-
-// Bot Scoring Logic
-function calculateBotScore(interactionType, details) {
-  let score = 0;
-  if (interactionType === 'decoy_form' && details.formData?.honeypot_field) score += 5;
-  if (interactionType === 'hidden_link') score += 3;
-  if (interactionType === 'fake_api') score += 2;
-  if (interactionType === 'dynamic_trap') score += 4;
-  if (interactionType === 'decoy_logout') score += 3;
-  if (interactionType === 'hidden_random') score += 2;
-  if (interactionType === 'invisible_trap') score += 3;
-  return score;
+/* ---------------- UID ---------------- */
+function ensureUID(req, res) {
+  if (!req.cookies.uid) {
+    const uid = "u_" + Math.random().toString(36).slice(2);
+    res.cookie("uid", uid, { httpOnly: true });
+    req.cookies.uid = uid;
+  }
 }
 
-// Logger
-async function logInteraction(req, interactionType, extraDetails = {}) {
-  const ip = req.headers['x-forwarded-for'] || req.connection.remoteAddress || '';
-  const userAgentStr = req.headers['user-agent'] || '';
-  const referrer = req.headers['referer'] || '';
-  const uniqueUserId =
-    extraDetails.uniqueUserId ||
-    req.query?.uid ||
-    req.body?.uniqueUserId ||
-    req.headers['x-unique-user-id'] ||
-    '';
+/* ---------------- CORE LOGIC ---------------- */
+async function logInteraction(req, type) {
 
-  const details = {
-    query: (req.query && Object.keys(req.query).length > 0) ? req.query : undefined,
-    formData: (req.body && Object.keys(req.body).length > 0) ? req.body : undefined,
-    trapId: extraDetails.trapId,
-    uniqueUserId: extraDetails.uniqueUserId || uniqueUserId,
-    ...extraDetails
+  // ✅ DECLARED ONCE — FIXES ReferenceError FOREVER
+  let botScore = null;
+  let classification = "unknown";
+
+  const ua = req.headers["user-agent"] || "";
+  const ip = req.socket.remoteAddress;
+  const ref = req.headers.referer || "";
+  const hour = new Date().getHours();
+
+  const explicitUid =
+    (req.query && req.query.uid) ||
+    (req.body && (req.body.uniqueUserId || req.body.uid));
+
+  const uid = explicitUid || req.cookies.uid || ip;
+
+  /* ---- FREQUENCY FEATURES ---- */
+  const ip_freq = Math.max(await Log.countDocuments({ ip }), 1);
+  const uid_freq = Math.max(await Log.countDocuments({ uniqueUserId: uid }), 1);
+
+  const features = {
+    userAgent_len: ua.length,
+    ua_bot_keyword: /bot|crawl|spider|scrapy|wget|curl|python/i.test(ua) ? 1 : 0,
+    referrer_present: ref ? 1 : 0,
+    night_activity: hour >= 0 && hour <= 5 ? 1 : 0,
+    ip_freq,
+    uid_freq
   };
 
-  const botScore = calculateBotScore(interactionType, details);
-  const classification = botScore >= 3 ? 'bot' : 'human';
-
-  const logEntry = new Log({
-    ip,
-    userAgent: userAgentStr,
-    referrer,
-    uniqueUserId,
-    interactionType,
-    details,
-    botScore,
-    classification
-  });
-
+  /* ---- ML SCORE ---- */
   try {
-    await logEntry.save();
-    console.log(`[Logged] ${interactionType} | IP: ${ip} | UID: ${uniqueUserId} | Class: ${classification} | Score: ${botScore}`);
+    const ml = await axios.post("http://127.0.0.1:8000/predict", features, {
+      timeout: 2000
+    });
+
+    botScore = Number(ml.data.score);
+    console.log("🧠 ML score:", botScore);
   } catch (err) {
-    console.error("Error saving log:", err);
+    console.error("❌ ML error:", err.message);
+    botScore = null;
   }
+
+  /* ---- DECISION ENGINE ---- */
+  if (botScore === null) classification = "unknown";
+  else if (botScore >= 0.75) classification = "bot";
+  else if (botScore >= 0.6) classification = "suspicious";
+  else classification = "human";
+
+  /* ---- HUMAN SAFETY ---- */
+  if (
+    classification !== "bot" &&
+    features.ua_bot_keyword === 0 &&
+    features.referrer_present === 1 &&
+    ip_freq <= 2 &&
+    uid_freq <= 2 &&
+    type === "page_view"
+  ) {
+    classification = "human";
+  }
+
+  /* ---- HONEYPOT CONFIRMATION (SAFE) ---- */
+  if (
+    type !== "page_view" &&
+    botScore !== null &&
+    botScore >= 0.6
+  ) {
+    classification = "bot";
+  }
+
+  /* ---- STORE LOG ---- */
+  await Log.create({
+    ip,
+    userAgent: ua,
+    referrer: ref,
+    interactionType: type,
+    botScore,
+    classification,
+    timestamp: new Date(),
+    uniqueUserId: uid
+  });
 }
 
-// Honeypot Routes
-app.get('/api/hidden', async (req, res) => {
-  await logInteraction(req, 'hidden_link', { query: req.query });
-  res.status(404).send('Not Found');
+/* ---------------- ROUTES ---------------- */
+
+app.get("/api/pageview", async (req, res) => {
+  ensureUID(req, res);
+  await logInteraction(req, "page_view");
+  res.send("Page viewed");
 });
 
-app.post('/api/decoy-login', async (req, res) => {
-  if (req.body.honeypot_field) {
-    await logInteraction(req, 'decoy_form', { formData: req.body });
-    return res.status(403).send('Forbidden');
-  }
-  res.send('Login successful (not really)');
+app.get("/api/hidden", async (req, res) => {
+  ensureUID(req, res);
+  await logInteraction(req, "hidden_link");
+  res.sendStatus(404);
 });
 
-app.post('/api/decoy-logout', async (req, res) => {
-  await logInteraction(req, 'decoy_logout', { formData: req.body });
-  res.status(403).send('Decoy logout triggered');
+app.post("/api/decoy", async (req, res) => {
+  ensureUID(req, res);
+  await logInteraction(req, "decoy_form");
+  res.redirect("/");
 });
 
-app.get('/api/fake-endpoint', async (req, res) => {
-  await logInteraction(req, 'fake_api', { query: req.query });
-  res.status(404).send('Not Found');
-});
+/* ---------------- DASHBOARD API ---------------- */
+app.get("/api/logs", async (req, res) => {
+  const logs = await Log.find()
+    .sort({ timestamp: -1 })
+    .limit(100)
+    .lean();
 
-app.get('/trap/:uid_token', async (req, res) => {
-  const [uniqueUserId] = req.params.uid_token.split('_');
-  await logInteraction(req, 'dynamic_trap', {
-    trapId: req.params.uid_token,
-    uniqueUserId,
-    query: req.query
+  const uids = logs.map(l => l.uniqueUserId).filter(Boolean);
+
+  const traces = await Trace.find({
+    uniqueUserId: { $in: uids }
+  }).lean();
+
+  const traceMap = {};
+  traces.forEach(t => {
+    traceMap[t.uniqueUserId] = {
+      leakUrls: t.leakUrls,
+      timestamp: t.timestamp
+    };
   });
-  res.status(404).send('Not Found');
+
+  const enrichedLogs = logs.map(log => ({
+    ...log,
+    traceStatus: traceMap[log.uniqueUserId] ? "Traced" : "Not Traced",
+    leakUrls: traceMap[log.uniqueUserId]?.leakUrls || [],
+    traceTimestamp: traceMap[log.uniqueUserId]?.timestamp || null
+  }));
+
+  res.json(enrichedLogs);
 });
 
-app.get('/api/hidden-random', async (req, res) => {
-  await logInteraction(req, 'hidden_random', { query: req.query });
-  res.status(404).send('Hidden random triggered');
+app.get("/dashboard", (req, res) => {
+  res.sendFile(__dirname + "/public/dashboard.html");
 });
 
-app.post('/api/invisible-trap', async (req, res) => {
-  await logInteraction(req, 'invisible_trap', { formData: req.body });
-  res.status(204).send();
+/* ---------------- START ---------------- */
+app.listen(3000, () => {
+  console.log("🚀 Server running on port 3000");
 });
-
-// Start Server
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));

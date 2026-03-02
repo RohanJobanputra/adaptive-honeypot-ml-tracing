@@ -10,6 +10,11 @@
   <!-- Normal user visible link -->
   <a href="/normal-page">Normal Page</a>
 
+  <form action="/api/decoy" method="POST">
+  <input type="email" name="email" placeholder="Enter email" required />
+  <button type="submit">Submit</button>
+</form>
+
   <!-- 1. Hidden honeypot link (invisible) -->
   <a href="/api/hidden?uid=xyz123" id="hidden-link" style="display:none;">Hidden Link</a>
 

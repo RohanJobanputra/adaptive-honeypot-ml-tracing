@@ -1,18 +1,20 @@
-// trace.js
 require('dotenv').config();
+console.log("GitHub token loaded:", !!process.env.GITHUB_TOKEN);
+
 const mongoose = require('mongoose');
 const axios = require('axios');
 
-// --- GitHub Gist Setup ---
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+// --- Config ---
+const BOT_SCORE_THRESHOLD = 0.75; // Only trace bots with score >= 0.75
 const GITHUB_API_URL = 'https://api.github.com/gists';
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 
 // --- MongoDB Setup ---
 mongoose.connect('mongodb://localhost:27017/honeypot_logs')
   .then(() => console.log("✅ Connected to MongoDB"))
   .catch(err => console.error("❌ MongoDB connection error:", err));
 
-// Schemas
+// --- Schemas ---
 const logSchema = new mongoose.Schema({
   timestamp: { type: Date, default: Date.now },
   ip: String,
@@ -34,18 +36,21 @@ const traceSchema = new mongoose.Schema({
 const Log = mongoose.model('Log', logSchema);
 const Trace = mongoose.model('Trace', traceSchema);
 
-// --- Step 1: Get recent bot UIDs
+// --- Step 1: Get recent high-confidence bot UIDs ---
 async function getRecentBotUids() {
   const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
   const uids = await Log.find({
     classification: 'bot',
+    botScore: { $gte: BOT_SCORE_THRESHOLD },
     uniqueUserId: { $ne: '' },
     timestamp: { $gte: oneHourAgo },
   }).distinct('uniqueUserId');
+
+  console.log(`Found ${uids.length} high-confidence bots in last hour.`);
   return uids;
 }
 
-// --- Step 2: Post UID as anonymous GitHub Gist
+// --- Step 2: Post UID to GitHub Gist ---
 async function postLeakToGist(uid) {
   const timestamp = new Date().toISOString();
   const content = `UID: ${uid}\nTimestamp: ${timestamp}`;
@@ -75,7 +80,7 @@ async function postLeakToGist(uid) {
   }
 }
 
-// --- Step 3: Verify UID is in Gist
+// --- Step 3: Verify UID in Gist ---
 async function scanGist(url, uid) {
   try {
     const { data } = await axios.get(url);
@@ -86,12 +91,12 @@ async function scanGist(url, uid) {
   }
 }
 
-// --- Step 4: Main Runner
+// --- Step 4: Main Tracer ---
 async function runTracer() {
   const uids = await getRecentBotUids();
 
   if (uids.length === 0) {
-    console.log("⚠️ No recent bot UIDs found.");
+    console.log("⚠️ No high-confidence bot UIDs found.");
     mongoose.disconnect();
     return;
   }

@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Honeypot Dashboard</title>
+  <style>
+    body { font-family: Arial; background: #0f172a; color: white; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border: 1px solid #334155; padding: 8px; vertical-align: top; }
+    th { background: #1e293b; }
+    tr:nth-child(even) { background: #020617; }
+    .leaked { color: #f87171; font-weight: bold; }
+    .safe { color: #4ade80; font-weight: bold; }
+    a { color: #fca5a5; word-break: break-all; }
+  </style>
+</head>
+
+<body>
+
+<h1>🕵️ Honeypot Activity Dashboard</h1>
+
+<table>
+  <thead>
+    <tr>
+      <th>Time</th>
+      <th>IP</th>
+      <th>Interaction</th>
+      <th>Bot Score</th>
+      <th>Classification</th>
+      <th>User ID</th>
+      <th>Trace Status</th>
+    </tr>
+  </thead>
+  <tbody id="logTable"></tbody>
+</table>
+
+<script>
+async function loadLogs() {
+  const res = await fetch('/api/logs');
+  const logs = await res.json();
+
+  const table = document.getElementById('logTable');
+  table.innerHTML = '';
+
+  logs.forEach(log => {
+    let traceHTML;
+
+    if (log.traceStatus === "Traced" && log.leakUrls.length > 0) {
+      traceHTML = `
+        <span class="leaked">TRACED</span><br>
+        ${log.leakUrls.map(url =>
+          `<small><a href="${url}" target="_blank" style="color:#fca5a5">${url}</a></small>`
+        ).join('<br>')}
+      `;
+    } else {
+      traceHTML = `<span class="safe">Not Traced</span>`;
+    }
+
+
+    const row = document.createElement('tr');
+    row.innerHTML = `
+      <td>${new Date(log.timestamp).toLocaleString()}</td>
+      <td>${log.ip}</td>
+      <td>${log.interactionType}</td>
+      <td>${log.botScore !== null ? log.botScore.toFixed(3) : '-'}</td>
+      <td>${log.classification}</td>
+      <td>${log.uniqueUserId || '-'}</td>
+      <td>${traceHTML}</td>
+    `;
+
+    table.appendChild(row);
+  });
+}
+
+loadLogs();
+setInterval(loadLogs, 5000);
+</script>
+
+</body>
+</html>
